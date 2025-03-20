@@ -1,3 +1,11 @@
+# python
+__pycache__/
+venv/
+random/
+old_versions/
+scraped_race_data_2018-2024.json
+horse_race_predictor.pth.epoch*
+
 # Logs
 logs
 *.log
