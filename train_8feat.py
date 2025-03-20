@@ -12,11 +12,24 @@ import logging
 import ijson
 import multiprocessing
 import argparse
+from torch.onnx import export
 
 # Parse command-line arguments
-parser = argparse.ArgumentParser(description="Train a horse race predictor model")
+parser = argparse.ArgumentParser(description="Train an 8-feature horse race predictor model")
 parser.add_argument('-d', '--debug', type=int, default=20, choices=[10, 20, 30, 40, 50],
                     help="Debug level: 10=DEBUG, 20=INFO, 30=WARNING, 40=ERROR, 50=CRITICAL (default: 20)")
+parser.add_argument('--pos-weight', type=float, default=10.0, help='Positive class weight for loss function (default: 10.0)')
+parser.add_argument('--learning-rate', type=float, default=0.001, help='Learning rate for optimizer (default: 0.001)')
+parser.add_argument('--epochs', type=int, default=20, help='Number of training epochs (default: 20)')
+parser.add_argument('--data-path', type=str, default='./horse-race-predictor/racedata/scraped_race_data_2018-2024.json',
+                    help='Path to combined race data JSON (default: ./horse-race-predictor/racedata/8feat/scraped_race_data_2018-2024.json)')
+parser.add_argument('--model-path', type=str, default='./horse-race-predictor/racedata/8feat/horse_race_predictor_8feat.pth',
+                    help='Path to save trained model (default: ./horse-race-predictor/racedata/8feat/horse_race_predictor_8feat.pth)')
+parser.add_argument('--scaler-path', type=str, default='./horse-race-predictor/racedata/8feat/scaler_8feat.pkl',
+                    help='Path to save scaler data (default: ./horse-race-predictor/racedata/8feat/scaler_8feat.pkl)')
+parser.add_argument('--onnx-path', type=str, default='./horse-race-predictor/racedata/8feat/horse_race_predictor_8feat.onnx',
+                    help='Path to save ONNX model (default: ./horse-race-predictor/racedata/8feat/horse_race_predictor_8feat.onnx)')
+
 args = parser.parse_args()
 
 # Setup logging with dynamic level
@@ -25,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 # Device setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+logger.info(f"Using device: {device}")
 
 # --- Model and Training Parameters ---
 BATCH_SIZE = 10000
@@ -42,9 +55,9 @@ HIDDEN_LAYERS = [
 ]
 OUTPUT_SIZE = 1
 
-NUM_EPOCHS = 20
-LEARNING_RATE = 0.001
-POS_WEIGHT = 10.0
+NUM_EPOCHS = args.epochs
+LEARNING_RATE = args.learning_rate
+POS_WEIGHT = args.pos_weight
 
 # --- End of Parameters ---
 
@@ -80,7 +93,7 @@ class RacePredictor(nn.Module):
 def combine_chunks(input_dir, output_file):
     all_data = []
     chunk_files = glob(os.path.join(input_dir, 'scraped_race_data_*.json'))
-    print(f"Found {len(chunk_files)} chunk files")
+    logger.info(f"Found {len(chunk_files)} chunk files")
     
     for file in chunk_files:
         with open(file, 'r') as f:
@@ -89,11 +102,11 @@ def combine_chunks(input_dir, output_file):
                 all_data.extend(data)
             else:
                 all_data.append(data)
-        print(f"Loaded {file} - Total entries: {len(all_data)}")
+        logger.info(f"Loaded {file} - Total entries: {len(all_data)}")
     
     with open(output_file, 'w') as f:
         json.dump(all_data, f, indent=2)
-    print(f"Combined data saved to {output_file} with {len(all_data)} entries")
+    logger.info(f"Combined data saved to {output_file} with {len(all_data)} entries")
 
 def process_batch(races, scaler=None, track_map=None):
     features = []
@@ -195,7 +208,7 @@ def stream_json_data(file_path, batch_size=BATCH_SIZE):
 
 def train_model_incrementally(data_path, model_path, scaler_path, val_split=0.2):
     num_cores = multiprocessing.cpu_count()
-    print(f"Detected {num_cores} CPU cores")
+    logger.info(f"Detected {num_cores} CPU cores")
 
     model = RacePredictor()
     model.to(device)
@@ -207,16 +220,16 @@ def train_model_incrementally(data_path, model_path, scaler_path, val_split=0.2)
     sample_features = []
     sampled = 0
     
-    print("Fitting scaler on sample data...")
+    logger.info("Fitting scaler on sample data...")
     batch_gen = stream_json_data(data_path)
     for batch_idx, batch in enumerate(batch_gen):
         features, _, track_map = process_batch(batch, track_map=track_map)
         if features is None:
-            print(f"Batch {batch_idx} has no valid features")
+            logger.warning(f"Batch {batch_idx} has no valid features")
             continue
         sample_features.append(features)
         sampled += len(features)
-        print(f"Sampled {sampled}/{SAMPLE_SIZE} entries")
+        logger.info(f"Sampled {sampled}/{SAMPLE_SIZE} entries")
         if sampled >= SAMPLE_SIZE:
             break
     
@@ -225,7 +238,7 @@ def train_model_incrementally(data_path, model_path, scaler_path, val_split=0.2)
     
     sample_features = np.vstack(sample_features)
     scaler.fit(sample_features)
-    print(f"Scaler fitted on {sampled} samples")
+    logger.info(f"Scaler fitted on {sampled} samples")
     
     with open(scaler_path, 'wb') as f:
         pickle.dump(scaler, f)
@@ -235,7 +248,7 @@ def train_model_incrementally(data_path, model_path, scaler_path, val_split=0.2)
     with open(scaler_path.replace('.pkl', '_track_map.json'), 'w') as f:
         json.dump(track_map, f, indent=2)
     
-    print("Collecting data for train/validation split...")
+    logger.info("Collecting data for train/validation split...")
     all_features = []
     all_labels = []
     total_wins = 0
@@ -248,7 +261,7 @@ def train_model_incrementally(data_path, model_path, scaler_path, val_split=0.2)
         total_wins += sum(labels)
     all_features = np.vstack(all_features)
     all_labels = np.hstack(all_labels)
-    print(f"Total samples: {len(all_labels)}, Total wins: {total_wins}")
+    logger.info(f"Total samples: {len(all_labels)}, Total wins: {total_wins}")
     
     if total_wins == 0:
         raise ValueError("No winning horses found in the dataset!")
@@ -293,9 +306,9 @@ def train_model_incrementally(data_path, model_path, scaler_path, val_split=0.2)
         avg_val_loss = total_val_loss / len(val_loader) if len(val_loader) > 0 else 0
         val_preds = np.array(val_preds)
         val_true = np.array(val_true)
-        print(f"Epoch {epoch+1}/{NUM_EPOCHS}:")
-        print(f"  Train Loss: {avg_train_loss:.4f}")
-        print(f"  Val Loss: {avg_val_loss:.4f}")
+        logger.info(f"Epoch {epoch+1}/{NUM_EPOCHS}:")
+        logger.info(f"  Train Loss: {avg_train_loss:.4f}")
+        logger.info(f"  Val Loss: {avg_val_loss:.4f}")
         
         bins = np.linspace(0, 1, 11)
         bin_indices = np.digitize(val_preds, bins) - 1
@@ -304,23 +317,31 @@ def train_model_incrementally(data_path, model_path, scaler_path, val_split=0.2)
             if bin_mask.sum() > 0:
                 bin_true = val_true[bin_mask].mean()
                 bin_pred = val_preds[bin_mask].mean()
-                print(f"  Prob {bins[i]:.1f}-{bins[i+1]:.1f}: Pred {bin_pred:.3f}, True {bin_true:.3f}, Count {bin_mask.sum()}")
+                logger.info(f"  Prob {bins[i]:.1f}-{bins[i+1]:.1f}: Pred {bin_pred:.3f}, True {bin_true:.3f}, Count {bin_mask.sum()}")
 
         torch.save(model.state_dict(), model_path + f".epoch{epoch+1}")
     
     torch.save(model.state_dict(), model_path)
-    print(f"Final model saved to {model_path}")
+    logger.info(f"Final model saved to {model_path}")
+
+    # Export to ONNX
+    model.eval()
+    dummy_input = torch.randn(1, INPUT_SIZE).to(device)
+    export(model, dummy_input, onnx_path, input_names=['input'], output_names=['output'], opset_version=11)
+    logger.info(f"Model exported to ONNX at {onnx_path}")
+
 
 def main():
     data_dir = './horse-race-predictor/racedata/'
-    combined_data_path = os.path.join(data_dir, 'scraped_race_data_2018-2024.json')
-    model_path = os.path.join(data_dir, 'horse_race_predictor.pth')
-    scaler_path = os.path.join(data_dir, 'scaler.pkl')
+    combined_data_path = args.data_path
+    model_path = args.model_path
+    scaler_path = args.scaler_path
     
     if not os.path.exists(combined_data_path):
-        print("Combining monthly data chunks...")
+        logger.info("Combining monthly data chunks...")
         combine_chunks(data_dir, combined_data_path)
     
+    logger.info(f"Training with POS_WEIGHT={POS_WEIGHT}, LEARNING_RATE={LEARNING_RATE}, EPOCHS={NUM_EPOCHS}")
     train_model_incrementally(combined_data_path, model_path, scaler_path)
 
 if __name__ == "__main__":

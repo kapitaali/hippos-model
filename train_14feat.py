@@ -15,9 +15,20 @@ import argparse
 from torch.onnx import export
 
 # Parse command-line arguments
-parser = argparse.ArgumentParser(description="Train a horse race predictor model")
+parser = argparse.ArgumentParser(description="Train a 14-feature horse race predictor model")
 parser.add_argument('-d', '--debug', type=int, default=20, choices=[10, 20, 30, 40, 50],
                     help="Debug level: 10=DEBUG, 20=INFO, 30=WARNING, 40=ERROR, 50=CRITICAL (default: 20)")
+parser.add_argument('--pos-weight', type=float, default=50.0, help='Positive class weight for loss function (default: 50.0)')
+parser.add_argument('--learning-rate', type=float, default=0.001, help='Learning rate for optimizer (default: 0.001)')
+parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs (default: 50)')
+parser.add_argument('--data-path', type=str, default='./horse-race-predictor/racedata/scraped_race_data_2018-2024.json',
+                    help='Path to combined race data JSON (default: ./horse-race-predictor/racedata/scraped_race_data_2018-2024.json)')
+parser.add_argument('--model-path', type=str, default='./horse-race-predictor/racedata/14feat/horse_race_predictor_14feat.pth',
+                    help='Path to save trained model (default: ./horse-race-predictor/racedata/14feat/horse_race_predictor.pth)')
+parser.add_argument('--scaler-path', type=str, default='./horse-race-predictor/racedata/14feat/scaler_14feat.pkl',
+                    help='Path to save scaler data (default: ./horse-race-predictor/racedata/14feat/scaler_14feat.pkl)')
+parser.add_argument('--onnx-path', type=str, default='./horse-race-predictor/racedata/14feat/horse_race_predictor_14feat.onnx',
+                    help='Path to save ONNX model (default: ./horse-race-predictor/racedata/14feat/horse_race_predictor_14feat.onnx)')
 args = parser.parse_args()
 
 # Setup logging
@@ -43,9 +54,9 @@ HIDDEN_LAYERS = [
 ]
 OUTPUT_SIZE = 1
 
-NUM_EPOCHS = 50
-LEARNING_RATE = 0.001
-POS_WEIGHT = 50.0
+NUM_EPOCHS = args.epochs
+LEARNING_RATE = args.learning_rate
+POS_WEIGHT = args.pos_weight
 
 # --- End of Parameters ---
 
@@ -332,15 +343,16 @@ def train_model_incrementally(data_path, model_path, scaler_path, onnx_path, val
 
 def main():
     data_dir = './horse-race-predictor/racedata/'
-    combined_data_path = os.path.join(data_dir, 'scraped_race_data_2018-2024.json')
-    model_path = os.path.join(data_dir, 'horse_race_predictor.pth')
-    scaler_path = os.path.join(data_dir, 'scaler.pkl')
-    onnx_path = os.path.join(data_dir, 'horse_race_predictor_expanded.onnx')
+    combined_data_path = args.data_path
+    model_path = args.model_path
+    scaler_path = args.scaler_path
+    onnx_path = args.onnx_path
     
     if not os.path.exists(combined_data_path):
         logger.info("Combining monthly data chunks...")
         combine_chunks(data_dir, combined_data_path)
     
+    logger.info(f"Training with POS_WEIGHT={POS_WEIGHT}, LEARNING_RATE={LEARNING_RATE}, EPOCHS={NUM_EPOCHS}")
     train_model_incrementally(combined_data_path, model_path, scaler_path, onnx_path)
 
 if __name__ == "__main__":
