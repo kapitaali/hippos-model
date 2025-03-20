@@ -182,4 +182,4 @@ The actual results show the finishing positions (e.g., 1st, 2nd, 3rd) or "DQ" fo
 - **14feat**: More conservative, misses some winners (e.g., "Sheikki"), but nails "Arctic Emerald." Stable but less adaptive (60% hit rate, $2.90 profit).
 - **8feat**: Bolder, catches more winners in top 3 (100% hit rate), lower Brier score (0.159 vs. 0.259), and higher profit ($51.90). Better calibrated here.
 
-**Recommendation**: **8feat** outperformed in this sample—use it for tomorrow’s bets, but monitor over more races. 14feat’s extra features might shine with larger datasets. Want to refine either model further?
+**Recommendation**: **8feat** outperformed in this sample. 
