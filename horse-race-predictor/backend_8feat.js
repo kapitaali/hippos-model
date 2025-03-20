@@ -1,4 +1,4 @@
-/* v1.6 */
+/* v1.7 */
 const express = require('express');
 const ort = require('onnxruntime-node');
 const fs = require('fs').promises;
@@ -44,6 +44,7 @@ async function predictHorse(horseData, trackCode) {
     console.log(`Predicting for horse: ${horseName}`);
     const horseStats = horseData.horse_stats?.total || {};
     const driverStats = horseData.driver_stats?.allTotal || {};
+    // Use only 8 features matching 8feat model (adjust based on training data)
     const features = [
         parseFloat(horseStats.winningPercent || 0),
         parseFloat(horseStats.priceMoney || 0),
@@ -52,25 +53,19 @@ async function predictHorse(horseData, trackCode) {
         parseFloat(driverStats.priceMoney || 0),
         parseFloat(driverStats.starts || 0),
         parseFloat(horseData.lane || 0),
-        parseFloat(trackMap[trackCode] || 0),
-        parseFloat(horseStats.gallopPercentage || 0),
-        parseFloat(horseStats.disqualificationPercentage || 0),
-        parseFloat(horseStats.improperGaitPercentage || 0),
-        parseFloat((driverStats.gallop || 0) / Math.max(driverStats.starts || 1, 1) * 100),
-        parseFloat((driverStats.disqualified || 0) / Math.max(driverStats.starts || 1, 1) * 100),
-        parseFloat((driverStats.improperGait || 0) / Math.max(driverStats.starts || 1, 1) * 100)
+        parseFloat(trackMap[trackCode] || 0)
     ];
 
     console.log('Raw features:', features);
     const standardizedFeatures = standardize(features);
     console.log('Standardized features:', standardizedFeatures);
 
-    const tensor = new ort.Tensor('float32', standardizedFeatures, [1, 14]);
+    const tensor = new ort.Tensor('float32', standardizedFeatures, [1, 8]); // 8 features
     const feeds = { input: tensor };
 
     try {
         const results = await session.run(feeds);
-        console.log('Model output:', results);
+        console.log('Raw model output:', results.output.data[0]);
         if (!results.output || !results.output.data || results.output.data.length === 0) {
             throw new Error('Model returned invalid output');
         }
@@ -95,20 +90,11 @@ async function fetchApiData(endpoint) {
 
 async function fetchAndPredictRaces(date, track) {
     let predictions = {};
-    const isPastDate = new Date(date) < new Date(); // Today’s date
+    const isPastDate = new Date(date) < new Date();
 
     console.log(`Processing races for ${date}/${track} - Past date: ${isPastDate}`);
 
-    let starts;
-    /*
-    if (isPastDate) {
-        console.log('Past dates not supported yet—use future dates for predictions');
-        return predictions; // Empty for past dates
-    } else {
-    */
-        starts = await fetchApiData(`/race/${date}/${track}/races`);
-    //}
-
+    let starts = await fetchApiData(`/race/${date}/${track}/races`);
     if (!starts || !Array.isArray(starts) || starts.length === 0) {
         console.log(`No valid starts for ${date}/${track}`);
         return predictions;
@@ -155,25 +141,15 @@ async function fetchAndPredictRaces(date, track) {
         }
     }
 
+    // Simplified normalization: floor at 0.001, then normalize once
     for (const startNumber in predictions) {
         const horses = predictions[startNumber];
-        const totalProb = Object.values(horses).reduce((sum, h) => sum + (h.winProbability || 0), 0);
+        const totalProb = Object.values(horses).reduce((sum, h) => sum + h.winProbability, 0);
         if (totalProb > 0) {
-            // Step 1: Initial normalization
             for (const programNumber in horses) {
-                horses[programNumber].winProbability = horses[programNumber].winProbability / totalProb;
-            }
-            // Step 2: Apply minimum probability floor (e.g., 0.01)
-            for (const programNumber in horses) {
-                horses[programNumber].winProbability = Math.max(horses[programNumber].winProbability, 0.03);
-            }
-            // Step 3: Renormalize to sum to 1.0
-            const newTotal = Object.values(horses).reduce((sum, h) => sum + h.winProbability, 0);
-            for (const programNumber in horses) {
-                horses[programNumber].winProbability = (horses[programNumber].winProbability / newTotal).toFixed(4);
+                horses[programNumber].winProbability = (horses[programNumber].winProbability / totalProb).toFixed(4);
             }
         } else {
-            // If totalProb is 0, assign uniform probabilities
             const numHorses = Object.keys(horses).length;
             for (const programNumber in horses) {
                 horses[programNumber].winProbability = (1 / numHorses).toFixed(4);
@@ -184,23 +160,6 @@ async function fetchAndPredictRaces(date, track) {
     console.log(`Generated predictions for ${Object.keys(predictions).length} races`);
     console.log('Final predictions:', JSON.stringify(predictions, null, 2));
     return predictions;
-
-
-/*
-    for (const startNumber in predictions) {
-        const horses = predictions[startNumber];
-        const totalProb = Object.values(horses).reduce((sum, h) => sum + (h.winProbability || 0), 0);
-        if (totalProb > 0) {
-            for (const programNumber in horses) {
-                horses[programNumber].winProbability = (horses[programNumber].winProbability / totalProb).toFixed(4);
-            }
-        }
-    }
-
-    console.log(`Generated predictions for ${Object.keys(predictions).length} races`);
-    console.log('Final predictions:', JSON.stringify(predictions, null, 2));
-    return predictions;
-*/    
 }
 
 app.post('/predict/:date/:track', async (req, res) => {
