@@ -57,6 +57,7 @@ OUTPUT_SIZE = 1
 NUM_EPOCHS = args.epochs
 LEARNING_RATE = args.learning_rate
 POS_WEIGHT = args.pos_weight
+onnx_path = args.onnx_path
 
 # --- End of Parameters ---
 
@@ -144,7 +145,8 @@ def process_batch(races, scaler=None, track_map=None):
         
         for start in starts:
             horse_data = start.get('horse_data', {})
-            horse_stats = next((s for s in start.get('horse_stats', {}).get('stats', []) if s.get('year') == '2024'), {})
+            #horse_stats = next((s for s in start.get('horse_stats', {}).get('stats', []) if s.get('year') == '2024'), {})
+            horse_stats = start.get('horse_stats', {}).get('total', {})  # Use allTotal for consistency            
             driver_stats = start.get('driver_stats', {}).get('allTotal', {})  # Use allTotal for consistency
             
             program_number = horse_data.get('programNumber', '0')

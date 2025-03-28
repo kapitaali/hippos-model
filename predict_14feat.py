@@ -9,18 +9,50 @@ import pickle
 from datetime import datetime
 import argparse
 import logging
+from pathlib import Path
+from tqdm import tqdm
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BASE_URL = "https://heppa.hippos.fi/heppa2_backend"
-HEADERS = {'Content-Type': 'application/json'}
+# Parse command-line arguments
+parser = argparse.ArgumentParser(description="Predict horse race outcomes with a 14-feature model")
+parser.add_argument('date', type=str, help='Date in YYYY-MM-DD format')
+parser.add_argument('--track', type=str, default=None, help='Track code (e.g., "H"); if not provided, fetched from API')
+parser.add_argument('--pos-weight', type=float, default=50.0, help='Positive class weight used in training (default: 50.0)')
+parser.add_argument('--learning-rate', type=float, default=0.001, help='Learning rate used in training (default: 0.001)')
+parser.add_argument('--model-path', type=str, default=None, help='Path to trained model (overrides pos-weight and learning-rate if provided)')
+parser.add_argument('--scaler-path', type=str, default=None, help='Path to scaler file (overrides pos-weight and learning-rate if provided)')
+parser.add_argument('--track-map-path', type=str, default='./horse-race-predictor/racedata/14feat/scaler_track_map.json',
+                    help='Path to track map file (default: ./horse-race-predictor/racedata/14feat/scaler_track_map.json)')
+parser.add_argument('--output-file', type=str, default=None, help='Path to save predictions as JSON (optional)')
+parser.add_argument('--debug', type=int, default=20, choices=[0, 10, 20, 30, 40],
+                    help='Debug level: 0=silent, 10=DEBUG, 20=INFO, 30=WARNING, 40=ERROR (default: 20)')
+args = parser.parse_args()
+
+# Setup logging
+if args.debug == 0:
+    logging.disable(logging.CRITICAL)
+else:
+    logging.basicConfig(level=args.debug, format='%(levelname)s: %(message)s')
 
 logger = logging.getLogger(__name__)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logger.info(f"Using device: {device}")
 
+BASE_URL = "https://heppa.hippos.fi/heppa2_backend"
+HEADERS = {'Content-Type': 'application/json'}
+CACHE_DIR = "./cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# Dynamically set model and scaler paths based on pos-weight and learning-rate unless overridden
+MODEL_DIR = './models/14feat'
+if args.model_path is None:
+    args.model_path = f"{MODEL_DIR}/horse_race_predictor_{args.pos_weight}pos_{args.learning_rate}learn.pth"
+if args.scaler_path is None:
+    args.scaler_path = f"{MODEL_DIR}/scaler_{args.pos_weight}pos_{args.learning_rate}learn.pkl"
 
 class HorseRaceDataset(Dataset):
     def __init__(self, data, scaler=None, track_map=None):
-        self.scaler = scaler
+        self.scaler = scaler if scaler else StandardScaler()
         self.track_map = track_map if track_map else {}
         self.features = []
         self.labels = []
@@ -32,66 +64,63 @@ class HorseRaceDataset(Dataset):
         if not self.features:
             logger.warning("No valid data processed")
             return
-        
-        raw_features = np.array(self.features)
-        logger.debug(f"First raw feature vector: {raw_features[0].tolist()}")
-        
-        if self.scaler:
-            logger.debug(f"Scaler expected features: {self.scaler.n_features_in_}")
-            if self.scaler.n_features_in_ != raw_features.shape[1]:
-                logger.error(f"Scaler mismatch: expected {self.scaler.n_features_in_} features, got {raw_features.shape[1]}")
-                raise ValueError("Feature count mismatch between scaler and data")
-            self.features = self.scaler.transform(raw_features)
+            
+        if scaler:
+            self.features = self.scaler.transform(np.array(self.features))
             logger.info("Applied precomputed scaler to features")
-            logger.debug(f"First scaled feature vector: {self.features[0].tolist()}")
-            logger.debug(f"Scaler mean: {self.scaler.mean_.tolist()}")
-            logger.debug(f"Scaler scale: {self.scaler.scale_.tolist()}")
         else:
-            logger.warning("No scaler provided; features unscaled")
-        
+            self.features = self.scaler.fit_transform(np.array(self.features))
+            logger.info("Fitted new scaler to features")
         self.features = torch.FloatTensor(self.features).to(device)
         self.labels = torch.FloatTensor(self.labels).to(device)
 
-    def process_api_data(self, data):
-        for race in data:
+    def process_api_data(self, api_data):
+        for race in tqdm(api_data, desc="Processing API data"):
             if not isinstance(race, dict):
-                logger.error(f"Invalid race data: {race}")
+                logger.error(f"Invalid race data (not a dict): {race}")
                 continue
             
-            track_code = race.get('trackCode', 'Unknown')
-            track_id = self.track_map.get(track_code, len(self.track_map))
-            date = race.get('raceDate', 'Unknown')
-            start_number = race.get('startNumber', 'Unknown')
-            horse_data = race.get('horse_data', {})
-            horse_stats = race.get('horse_stats', {}).get('total', {})
-            driver_stats = race.get('driver_stats', {}).get('allTotal', {})
-            
-            feature_vector = [
-                float(horse_stats.get('winningPercent', 0)),
-                float(horse_stats.get('priceMoney', 0)),
-                float(horse_stats.get('starts', 0)),
-                float(driver_stats.get('winPercentage', 0)),
-                float(driver_stats.get('priceMoney', 0)),
-                float(driver_stats.get('starts', 0)),
-                float(horse_data.get('lane', 0)),
-                float(track_id),
-                float(horse_stats.get('gallopPercentage', 0)),
-                float(horse_stats.get('disqualificationPercentage', 0)),
-                float(horse_stats.get('improperGaitPercentage', 0) or 0),
-                float(driver_stats.get('gallop', 0)) / max(float(driver_stats.get('starts', 1)), 1) * 100,
-                float(driver_stats.get('disqualified', 0)) / max(float(driver_stats.get('starts', 1)), 1) * 100,
-                float(driver_stats.get('improperGait', 0)) / max(float(driver_stats.get('starts', 1)), 1) * 100
-            ]
-            
-            self.features.append(feature_vector)
-            self.labels.append(0)
-            self.horse_info.append({
-                'date': date,
-                'track': track_code,
-                'start': start_number,
-                'horse': horse_data.get('horseName', 'Unknown'),
-                'driver': horse_data.get('driverName', 'Unknown')
-            })
+            try:
+                track_code = race.get('trackCode', 'Unknown')
+                track_id = self.track_map.get(track_code, len(self.track_map))
+                date = race.get('raceDate', 'Unknown')
+                start_number = race.get('startNumber', 'Unknown')
+                horse_data = race.get('horse_data', {})
+                horse_stats = race.get('horse_stats', {}).get('total', {})
+                driver_stats = race.get('driver_stats', {}).get('allTotal', {})
+
+                feature_vector = [
+                    float(horse_stats.get('winningPercent', 0)),
+                    float(horse_stats.get('priceMoney', 0)),
+                    float(horse_stats.get('starts', 0)),
+                    float(driver_stats.get('winPercentage', 0)),
+                    float(driver_stats.get('priceMoney', 0)),
+                    float(driver_stats.get('starts', 0)),
+                    float(horse_data.get('lane', 0)),
+                    float(track_id),
+                    float(horse_stats.get('gallopPercentage', 0)),
+                    float(horse_stats.get('disqualificationPercentage', 0)),
+                    float(horse_stats.get('improperGaitPercentage', 0) or 0),
+                    float(driver_stats.get('gallop', 0)) / max(float(driver_stats.get('starts', 1)), 1) * 100,
+                    float(driver_stats.get('disqualified', 0)) / max(float(driver_stats.get('starts', 1)), 1) * 100,
+                    float(driver_stats.get('improperGait', 0)) / max(float(driver_stats.get('starts', 1)), 1) * 100
+                ]
+                
+                logger.debug(f"Horse {horse_data.get('horseName', 'Unknown')} (Start {start_number}): Features: {[f'{x:.2f}' for x in feature_vector]}")
+                
+                self.features.append(feature_vector)
+                self.labels.append(0)  # No labels for prediction
+                self.horse_info.append({
+                    'date': date,
+                    'track': track_code,
+                    'start': start_number,
+                    'horse': horse_data.get('horseName', 'Unknown'),
+                    'driver': horse_data.get('driverName', 'Unknown')
+                })
+            except Exception as e:
+                logger.error(f"Failed to process race {race.get('startNumber', 'Unknown')}: {e}")
+                logger.debug(f"Race data: {json.dumps(race, indent=2)}")
+                continue
 
     def __len__(self):
         return len(self.features)
@@ -118,13 +147,25 @@ class RacePredictor(nn.Module):
     def forward(self, x):
         return self.network(x).squeeze()
 
-def fetch_api_data(endpoint):
-    url = f"{BASE_URL}{endpoint}"
+def fetch_api_data(endpoint, base_url=BASE_URL, headers=HEADERS, cache_dir=CACHE_DIR):
+    """Fetch data from API with caching."""
+    cache_key = f"predict_14feat_{endpoint.replace('/', '_').replace('?', '_').replace('&', '_')}"
+    cache_file = Path(cache_dir) / f"{cache_key}.json"
+    
+    if cache_file.exists():
+        logger.info(f"Loading cached data for {endpoint} from {cache_file}")
+        with open(cache_file, 'r') as f:
+            return json.load(f)
+    
+    url = f"{base_url}{endpoint}"
     try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
+        response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         data = response.json()
         logger.debug(f"Fetched data from {endpoint} - Status: {response.status_code}")
+        with open(cache_file, 'w') as f:
+            json.dump(data, f, indent=2)
+        logger.info(f"Cached data to {cache_file}")
         return data
     except requests.RequestException as e:
         logger.error(f"Error fetching {url}: {e}")
@@ -172,7 +213,8 @@ def fetch_races(date, track):
             })
     
     logger.info(f"Enriched {len(enriched_races)} races")
-    logger.debug(f"Sample race data: {json.dumps(enriched_races[0], indent=2)}")
+    if enriched_races and logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"Sample race data: {json.dumps(enriched_races[0], indent=2)}")
     return enriched_races
 
 def predict_races(model, predict_loader, dataset):
@@ -183,9 +225,10 @@ def predict_races(model, predict_loader, dataset):
             features = features.to(device)
             outputs = model(features)
             probabilities = outputs.cpu().numpy().tolist()
-            if len(predictions) < 5:
-                formatted_probs = [f"{p:.10f}" for p in probabilities[:5]]
-                logger.debug(f"Raw model outputs (first 5, 10 decimals): {formatted_probs}")
+            logger.debug(f"Raw probabilities before normalization (first 5): {[f'{p:.4f}' for p in probabilities[:5]]}")
+#            if len(predictions) < 5:
+#                formatted_probs = [f"{p:.10f}" for p in probabilities[:5]]
+#                logger.debug(f"Raw model outputs (first 5, 10 decimals): {formatted_probs}")
             predictions.extend(probabilities)
 
     # Group by race (start number)
@@ -225,23 +268,12 @@ def get_track_code(date):
     return None
 
 def main():
-    parser = argparse.ArgumentParser(description="Predict horse race outcomes")
-    parser.add_argument('date', type=str, help='YYYY-MM-DD')
-    parser.add_argument('-d', '--debug', type=int, default=20, 
-                        choices=[0, 10, 20, 30, 40], 
-                        help="Debug level: 0=silent, 10=DEBUG, 20=INFO, 30=WARNING, 40=ERROR (default: 20)")
-    args = parser.parse_args()
-
-    if args.debug == 0:
-        logging.disable(logging.CRITICAL)
-    else:
-        logging.basicConfig(level=args.debug, format='%(levelname)s: %(message)s')
-
     date = args.date
-    data_dir = './horse-race-predictor/racedata/'
-    model_path = os.path.join(data_dir, 'horse_race_predictor.pth')
-    scaler_path = os.path.join(data_dir, 'scaler.pkl')
-    track_map_path = os.path.join(data_dir, 'scaler_track_map.json')
+    track = args.track if args.track else get_track_code(date)[0] if get_track_code(date) else 'H'  # Default to 'H' if no track found
+    
+    model_path = args.model_path
+    scaler_path = args.scaler_path
+    track_map_path = args.track_map_path
 
     model = RacePredictor()
     if not os.path.exists(model_path):
@@ -257,17 +289,18 @@ def main():
         with open(scaler_path, 'rb') as f:
             scaler = pickle.load(f)
         logger.info("Loaded precomputed scaler")
+    else:
+        logger.warning(f"Scaler file not found at {scaler_path}, proceeding without scaler")
+
     track_map = {}
     if os.path.exists(track_map_path):
         with open(track_map_path, 'r') as f:
             track_map = json.load(f)
         logger.info(f"Loaded track map with {len(track_map)} entries")
+    else:
+        logger.warning(f"Track map file not found at {track_map_path}, using empty track map")
 
-    tracks = get_track_code(date)
-    if not tracks:
-        logger.error("No tracks retrieved; exiting")
-        return
-    track = tracks[0]
+    logger.info(f"Fetching race data for {date}/{track}...")
     api_data = fetch_races(date, track)
     if not api_data:
         logger.error("No race data retrieved; exiting")
@@ -287,8 +320,17 @@ def main():
         {k: f"{v:.10f}" if k == 'win_probability' else v for k, v in pred.items()}
         for pred in predictions
     ]
+    predictions_json = json.dumps(formatted_predictions, indent=2)
     logger.info("Predictions JSON:")
-    print(json.dumps(formatted_predictions, indent=2))
+    print(predictions_json)
+
+    if args.output_file:
+        try:
+            with open(args.output_file, 'w') as f:
+                f.write(predictions_json)
+            logger.info(f"Predictions saved to {args.output_file}")
+        except Exception as e:
+            logger.error(f"Failed to write predictions to {args.output_file}: {e}")
 
 if __name__ == "__main__":
     main()

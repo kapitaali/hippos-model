@@ -19,20 +19,19 @@ parser = argparse.ArgumentParser(description="Train an 8-feature horse race pred
 parser.add_argument('-d', '--debug', type=int, default=20, choices=[10, 20, 30, 40, 50],
                     help="Debug level: 10=DEBUG, 20=INFO, 30=WARNING, 40=ERROR, 50=CRITICAL (default: 20)")
 parser.add_argument('--pos-weight', type=float, default=10.0, help='Positive class weight for loss function (default: 10.0)')
-parser.add_argument('--learning-rate', type=float, default=0.001, help='Learning rate for optimizer (default: 0.001)')
+parser.add_argument('--learning-rate', type=float, default=0.0005, help='Learning rate for optimizer (default: 0.0005)')
 parser.add_argument('--epochs', type=int, default=20, help='Number of training epochs (default: 20)')
 parser.add_argument('--data-path', type=str, default='./horse-race-predictor/racedata/scraped_race_data_2018-2024.json',
-                    help='Path to combined race data JSON (default: ./horse-race-predictor/racedata/8feat/scraped_race_data_2018-2024.json)')
+                    help='Path to combined race data JSON (default: ./horse-race-predictor/racedata/scraped_race_data_2018-2024.json)')
 parser.add_argument('--model-path', type=str, default='./horse-race-predictor/racedata/8feat/horse_race_predictor_8feat.pth',
                     help='Path to save trained model (default: ./horse-race-predictor/racedata/8feat/horse_race_predictor_8feat.pth)')
 parser.add_argument('--scaler-path', type=str, default='./horse-race-predictor/racedata/8feat/scaler_8feat.pkl',
                     help='Path to save scaler data (default: ./horse-race-predictor/racedata/8feat/scaler_8feat.pkl)')
 parser.add_argument('--onnx-path', type=str, default='./horse-race-predictor/racedata/8feat/horse_race_predictor_8feat.onnx',
                     help='Path to save ONNX model (default: ./horse-race-predictor/racedata/8feat/horse_race_predictor_8feat.onnx)')
-
 args = parser.parse_args()
 
-# Setup logging with dynamic level
+# Setup logging
 logging.basicConfig(level=args.debug, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -45,7 +44,7 @@ BATCH_SIZE = 10000
 SAMPLE_SIZE = 100000
 MAX_RAM_MB = 50000
 
-INPUT_SIZE = 8
+INPUT_SIZE = 8  # Adjusted to 8 features
 HIDDEN_LAYERS = [
     (128, 0.4),
     (96, 0.4),
@@ -58,12 +57,13 @@ OUTPUT_SIZE = 1
 NUM_EPOCHS = args.epochs
 LEARNING_RATE = args.learning_rate
 POS_WEIGHT = args.pos_weight
+onnx_path = args.onnx_path
 
 # --- End of Parameters ---
 
 class HorseRaceDataset(Dataset):
     def __init__(self, features, labels):
-        self.features = torch.FloatTensor(features)
+        self.features = torch.FloatTensor(features)  # Keep on CPU until training
         self.labels = torch.FloatTensor(labels)
 
     def __len__(self):
@@ -145,8 +145,8 @@ def process_batch(races, scaler=None, track_map=None):
         
         for start in starts:
             horse_data = start.get('horse_data', {})
-            horse_stats = start.get('horse_stats', {}).get('total', {})
-            driver_stats = start.get('driver_stats', {}).get('allTotal', {})
+            horse_stats = start.get('horse_stats', {}).get('total', {})  # Use total for consistency
+            driver_stats = start.get('driver_stats', {}).get('allTotal', {})  # Use allTotal for consistency
             
             program_number = horse_data.get('programNumber', '0')
             feature_vector = [
@@ -167,6 +167,7 @@ def process_batch(races, scaler=None, track_map=None):
             
             if not features and logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"Sample horse_data: {json.dumps(horse_data, indent=2)}")
+                logger.debug(f"Sample driver_stats (allTotal): {json.dumps(driver_stats, indent=2)}")
             
             features.append(feature_vector)
             labels.append(label)
@@ -176,10 +177,13 @@ def process_batch(races, scaler=None, track_map=None):
         return None, None, track_map
     
     features = np.array(features)
-    logger.info(f"Total wins in batch: {win_count}/{len(labels)}")  # Level 20 (INFO)
+    logger.info(f"Total wins in batch: {win_count}/{len(labels)}")
     logger.debug(f"Batch features shape: {features.shape}, Wins: {win_count}/{len(labels)}")
     if scaler:
         features = scaler.transform(features)
+        logger.debug(f"First scaled feature vector: {features[0].tolist()}")
+    else:
+        logger.debug(f"First raw feature vector: {features[0].tolist()}")
     return features, labels, track_map
 
 def stream_json_data(file_path, batch_size=BATCH_SIZE):
@@ -206,7 +210,7 @@ def stream_json_data(file_path, batch_size=BATCH_SIZE):
             yield races
     logger.info(f"Total races processed: {total_races}")
 
-def train_model_incrementally(data_path, model_path, scaler_path, val_split=0.2):
+def train_model_incrementally(data_path, model_path, scaler_path, onnx_path, val_split=0.2):
     num_cores = multiprocessing.cpu_count()
     logger.info(f"Detected {num_cores} CPU cores")
 
@@ -239,6 +243,8 @@ def train_model_incrementally(data_path, model_path, scaler_path, val_split=0.2)
     sample_features = np.vstack(sample_features)
     scaler.fit(sample_features)
     logger.info(f"Scaler fitted on {sampled} samples")
+    logger.debug(f"Scaler mean: {scaler.mean_.tolist()}")
+    logger.debug(f"Scaler scale: {scaler.scale_.tolist()}")
     
     with open(scaler_path, 'wb') as f:
         pickle.dump(scaler, f)
@@ -273,8 +279,8 @@ def train_model_incrementally(data_path, model_path, scaler_path, val_split=0.2)
     train_dataset = HorseRaceDataset(train_features, train_labels)
     val_dataset = HorseRaceDataset(val_features, val_labels)
     
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=min(8, num_cores), pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=min(8, num_cores), pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=10, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=10, pin_memory=True)
 
     for epoch in range(NUM_EPOCHS):
         model.train()
@@ -330,19 +336,19 @@ def train_model_incrementally(data_path, model_path, scaler_path, val_split=0.2)
     export(model, dummy_input, onnx_path, input_names=['input'], output_names=['output'], opset_version=11)
     logger.info(f"Model exported to ONNX at {onnx_path}")
 
-
 def main():
     data_dir = './horse-race-predictor/racedata/'
     combined_data_path = args.data_path
     model_path = args.model_path
     scaler_path = args.scaler_path
+    onnx_path = args.onnx_path
     
     if not os.path.exists(combined_data_path):
         logger.info("Combining monthly data chunks...")
         combine_chunks(data_dir, combined_data_path)
     
     logger.info(f"Training with POS_WEIGHT={POS_WEIGHT}, LEARNING_RATE={LEARNING_RATE}, EPOCHS={NUM_EPOCHS}")
-    train_model_incrementally(combined_data_path, model_path, scaler_path)
+    train_model_incrementally(combined_data_path, model_path, scaler_path, onnx_path)
 
 if __name__ == "__main__":
     main()
