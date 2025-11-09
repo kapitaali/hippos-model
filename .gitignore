@@ -5,7 +5,7 @@ random/
 old_versions/
 scraped_race_data_2018-2024.json
 horse_race_predictor.pth.epoch*
-cache/
+cache*/
 cache_predict_xgb/
 cache_train/
 results/

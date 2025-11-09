@@ -1,0 +1,13 @@
+{
+  "selected_metric": "auc",
+  "best_params_from_validation": {
+    "learning_rate": 0.01,
+    "scale_pos_weight": 2.0,
+    "max_depth": 5,
+    "subsample": 0.8,
+    "colsample_bytree": 0.9,
+    "n_estimators": 3020
+  },
+  "best_iteration_used": 3020,
+  "validation_score": 0.85594
+}
